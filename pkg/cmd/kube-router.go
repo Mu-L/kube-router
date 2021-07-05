@@ -6,6 +6,7 @@ import (
 	"os/signal"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/cloudnativelabs/kube-router/pkg/controllers/netpol"
 	"github.com/cloudnativelabs/kube-router/pkg/controllers/proxy"
@@ -15,8 +16,6 @@ import (
 	"github.com/cloudnativelabs/kube-router/pkg/options"
 	"github.com/cloudnativelabs/kube-router/pkg/version"
 	"k8s.io/klog/v2"
-
-	"time"
 
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
@@ -72,6 +71,7 @@ func CleanupConfigAndExit() {
 // Run starts the controllers and waits forever till we get SIGINT or SIGTERM
 func (kr *KubeRouter) Run() error {
 	var err error
+	var ipsetMutex sync.Mutex
 	var wg sync.WaitGroup
 	healthChan := make(chan *healthcheck.ControllerHeartbeat, 10)
 	defer close(healthChan)
@@ -125,22 +125,23 @@ func (kr *KubeRouter) Run() error {
 
 	if kr.Config.BGPGracefulRestart {
 		if kr.Config.BGPGracefulRestartTime > time.Second*4095 {
-			return errors.New("BGPGracefuleRestartTime should be less than 4095 seconds")
+			return errors.New("BGPGracefulRestartTime should be less than 4095 seconds")
 		}
 		if kr.Config.BGPGracefulRestartTime <= 0 {
-			return errors.New("BGPGracefuleRestartTime must be positive")
+			return errors.New("BGPGracefulRestartTime must be positive")
 		}
 
 		if kr.Config.BGPGracefulRestartDeferralTime > time.Hour*18 {
-			return errors.New("BGPGracefuleRestartDeferralTime should be less than 18 hours")
+			return errors.New("BGPGracefulRestartDeferralTime should be less than 18 hours")
 		}
 		if kr.Config.BGPGracefulRestartDeferralTime <= 0 {
-			return errors.New("BGPGracefuleRestartDeferralTime must be positive")
+			return errors.New("BGPGracefulRestartDeferralTime must be positive")
 		}
 	}
 
 	if kr.Config.RunRouter {
-		nrc, err := routing.NewNetworkRoutingController(kr.Client, kr.Config, nodeInformer, svcInformer, epInformer)
+		nrc, err := routing.NewNetworkRoutingController(kr.Client, kr.Config,
+			nodeInformer, svcInformer, epInformer, &ipsetMutex)
 		if err != nil {
 			return errors.New("Failed to create network routing controller: " + err.Error())
 		}
@@ -162,7 +163,7 @@ func (kr *KubeRouter) Run() error {
 
 	if kr.Config.RunServiceProxy {
 		nsc, err := proxy.NewNetworkServicesController(kr.Client, kr.Config,
-			svcInformer, epInformer, podInformer)
+			svcInformer, epInformer, podInformer, &ipsetMutex)
 		if err != nil {
 			return errors.New("Failed to create network services controller: " + err.Error())
 		}
@@ -183,7 +184,7 @@ func (kr *KubeRouter) Run() error {
 
 	if kr.Config.RunFirewall {
 		npc, err := netpol.NewNetworkPolicyController(kr.Client,
-			kr.Config, podInformer, npInformer, nsInformer)
+			kr.Config, podInformer, npInformer, nsInformer, &ipsetMutex)
 		if err != nil {
 			return errors.New("Failed to create network policy controller: " + err.Error())
 		}

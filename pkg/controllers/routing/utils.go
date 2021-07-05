@@ -5,8 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"regexp"
 	"strconv"
 	"strings"
+
+	"github.com/osrg/gobgp/pkg/packet/bgp"
 
 	"github.com/vishvananda/netlink"
 )
@@ -106,29 +109,6 @@ func getNodeSubnet(nodeIP net.IP) (net.IPNet, string, error) {
 	return net.IPNet{}, "", errors.New("failed to find interface with specified node ip")
 }
 
-func getMTUFromNodeIP(nodeIP net.IP, overlayEnabled bool) (int, error) {
-	links, err := netlink.LinkList()
-	if err != nil {
-		return 0, errors.New("failed to get list of links")
-	}
-	for _, link := range links {
-		addresses, err := netlink.AddrList(link, netlink.FAMILY_ALL)
-		if err != nil {
-			return 0, errors.New("failed to get list of addr")
-		}
-		for _, addr := range addresses {
-			if addr.IPNet.IP.Equal(nodeIP) {
-				linkMTU := link.Attrs().MTU
-				if overlayEnabled {
-					return linkMTU - 20, nil // -20 to accommodate IPIP header
-				}
-				return linkMTU, nil
-			}
-		}
-	}
-	return 0, errors.New("failed to find interface with specified node ip")
-}
-
 // generateTunnelName will generate a name for a tunnel interface given a node IP
 // for example, if the node IP is 10.0.0.1 the tunnel interface will be named tun-10001
 // Since linux restricts interface names to 15 characters, if length of a node IP
@@ -142,4 +122,30 @@ func generateTunnelName(nodeIP string) string {
 	}
 
 	return "tun" + hash
+}
+
+// validateCommunity takes in a string and attempts to parse a BGP community out of it in a way that is similar to
+// gobgp (internal/pkg/table/policy.go:ParseCommunity()). If it is not able to parse the community information it
+// returns an error.
+func validateCommunity(arg string) error {
+	_, err := strconv.ParseUint(arg, 10, 32)
+	if err == nil {
+		return nil
+	}
+
+	_regexpCommunity := regexp.MustCompile(`(\d+):(\d+)`)
+	elems := _regexpCommunity.FindStringSubmatch(arg)
+	if len(elems) == 3 {
+		if _, err := strconv.ParseUint(elems[1], 10, 16); err == nil {
+			if _, err = strconv.ParseUint(elems[2], 10, 16); err == nil {
+				return nil
+			}
+		}
+	}
+	for _, v := range bgp.WellKnownCommunityNameMap {
+		if arg == v {
+			return nil
+		}
+	}
+	return fmt.Errorf("failed to parse %s as community", arg)
 }

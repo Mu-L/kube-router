@@ -17,6 +17,8 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/net/context"
+
 	"github.com/cloudnativelabs/kube-router/pkg/cri"
 	"github.com/cloudnativelabs/kube-router/pkg/healthcheck"
 	"github.com/cloudnativelabs/kube-router/pkg/metrics"
@@ -28,7 +30,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
-	"golang.org/x/net/context"
 	api "k8s.io/api/core/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
@@ -89,7 +90,7 @@ type netlinkCalls interface {
 	getKubeDummyInterface() (netlink.Link, error)
 	setupRoutesForExternalIPForDSR(serviceInfoMap) error
 	setupPolicyRoutingForDSR() error
-	cleanupMangleTableRule(ip string, protocol string, port string, fwmark string) error
+	cleanupMangleTableRule(ip string, protocol string, port string, fwmark string, tcpMSS int) error
 }
 
 // LinuxNetworking interface contains all linux networking subsystem calls
@@ -220,6 +221,7 @@ type NetworkServicesController struct {
 	ln                  LinuxNetworking
 	readyForUpdates     bool
 	ProxyFirewallSetup  *sync.Cond
+	ipsetMutex          *sync.Mutex
 
 	// Map of ipsets that we use.
 	ipsetMap map[string]*utils.Set
@@ -236,6 +238,7 @@ type NetworkServicesController struct {
 	gracefulTermination bool
 	syncChan            chan int
 	dsr                 *dsrOpt
+	dsrTCPMSS           int
 }
 
 // DSR related options
@@ -647,6 +650,13 @@ func (nsc *NetworkServicesController) cleanupIpvsFirewall() {
 	}
 
 	// Clear ipsets.
+	klog.V(1).Infof("Attempting to attain ipset mutex lock")
+	nsc.ipsetMutex.Lock()
+	klog.V(1).Infof("Attained ipset mutex lock, continuing...")
+	defer func() {
+		nsc.ipsetMutex.Unlock()
+		klog.V(1).Infof("Returned ipset mutex lock")
+	}()
 	ipSetHandler, err := utils.NewIPSet(false)
 	if err != nil {
 		klog.Errorf("Failed to initialize ipset handler: %s", err.Error())
@@ -673,6 +683,13 @@ func (nsc *NetworkServicesController) syncIpvsFirewall() error {
 	   - update ipsets based on currently active IPVS services
 	*/
 	var err error
+	klog.V(1).Infof("Attempting to attain ipset mutex lock")
+	nsc.ipsetMutex.Lock()
+	klog.V(1).Infof("Attained ipset mutex lock, continuing...")
+	defer func() {
+		nsc.ipsetMutex.Unlock()
+		klog.V(1).Infof("Returned ipset mutex lock")
+	}()
 
 	localIPsIPSet := nsc.ipsetMap[localIPsIPSetName]
 
@@ -2025,8 +2042,8 @@ const (
 	externalIPRouteTableName = "external_ip"
 )
 
-// setupMangleTableRule: setsup iptables rule to FWMARK the traffic to exteranl IP vip
-func setupMangleTableRule(ip string, protocol string, port string, fwmark string) error {
+// setupMangleTableRule: sets up iptables rule to FWMARK the traffic to external IP vip
+func setupMangleTableRule(ip string, protocol string, port string, fwmark string, tcpMSS int) error {
 	iptablesCmdHandler, err := iptables.New()
 	if err != nil {
 		return errors.New("Failed to initialize iptables executor" + err.Error())
@@ -2040,10 +2057,23 @@ func setupMangleTableRule(ip string, protocol string, port string, fwmark string
 	if err != nil {
 		return errors.New("Failed to run iptables command to set up FWMARK due to " + err.Error())
 	}
+
+	// setup iptables rule TCPMSS for DSR mode to fix mtu problem
+	mtuArgs := []string{"-d", ip, "-m", "tcp", "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS",
+		"--set-mss", strconv.Itoa(tcpMSS)}
+	err = iptablesCmdHandler.AppendUnique("mangle", "PREROUTING", mtuArgs...)
+	if err != nil {
+		return errors.New("Failed to run iptables command to set up TCPMSS due to " + err.Error())
+	}
+	mtuArgs[0] = "-s"
+	err = iptablesCmdHandler.AppendUnique("mangle", "POSTROUTING", mtuArgs...)
+	if err != nil {
+		return errors.New("Failed to run iptables command to set up TCPMSS due to " + err.Error())
+	}
 	return nil
 }
 
-func (ln *linuxNetworking) cleanupMangleTableRule(ip string, protocol string, port string, fwmark string) error {
+func (ln *linuxNetworking) cleanupMangleTableRule(ip string, protocol string, port string, fwmark string, tcpMSS int) error {
 	iptablesCmdHandler, err := iptables.New()
 	if err != nil {
 		return errors.New("Failed to initialize iptables executor" + err.Error())
@@ -2067,6 +2097,31 @@ func (ln *linuxNetworking) cleanupMangleTableRule(ip string, protocol string, po
 		err = iptablesCmdHandler.Delete("mangle", "OUTPUT", args...)
 		if err != nil {
 			return errors.New("Failed to cleanup iptables command to set up FWMARK due to " + err.Error())
+		}
+	}
+
+	// cleanup iptables rule TCPMSS
+	mtuArgs := []string{"-d", ip, "-m", "tcp", "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS",
+		"--set-mss", strconv.Itoa(tcpMSS)}
+	exists, err = iptablesCmdHandler.Exists("mangle", "PREROUTING", mtuArgs...)
+	if err != nil {
+		return errors.New("Failed to cleanup iptables command to set up TCPMSS due to " + err.Error())
+	}
+	if exists {
+		err = iptablesCmdHandler.Delete("mangle", "PREROUTING", mtuArgs...)
+		if err != nil {
+			return errors.New("Failed to cleanup iptables command to set up TCPMSS due to " + err.Error())
+		}
+	}
+	mtuArgs[0] = "-s"
+	exists, err = iptablesCmdHandler.Exists("mangle", "POSTROUTING", mtuArgs...)
+	if err != nil {
+		return errors.New("Failed to cleanup iptables command to set up TCPMSS due to " + err.Error())
+	}
+	if exists {
+		err = iptablesCmdHandler.Delete("mangle", "POSTROUTING", mtuArgs...)
+		if err != nil {
+			return errors.New("Failed to cleanup iptables command to set up TCPMSS due to " + err.Error())
 		}
 	}
 
@@ -2423,7 +2478,7 @@ func (nsc *NetworkServicesController) handleServiceDelete(obj interface{}) {
 // NewNetworkServicesController returns NetworkServicesController object
 func NewNetworkServicesController(clientset kubernetes.Interface,
 	config *options.KubeRouterConfig, svcInformer cache.SharedIndexInformer,
-	epInformer cache.SharedIndexInformer, podInformer cache.SharedIndexInformer) (*NetworkServicesController, error) {
+	epInformer cache.SharedIndexInformer, podInformer cache.SharedIndexInformer, ipsetMutex *sync.Mutex) (*NetworkServicesController, error) {
 
 	var err error
 	ln, err := newLinuxNetworking()
@@ -2431,7 +2486,7 @@ func NewNetworkServicesController(clientset kubernetes.Interface,
 		return nil, err
 	}
 
-	nsc := NetworkServicesController{ln: ln}
+	nsc := NetworkServicesController{ln: ln, ipsetMutex: ipsetMutex}
 
 	if config.MetricsEnabled {
 		//Register the metrics for this controller
@@ -2500,6 +2555,14 @@ func NewNetworkServicesController(clientset kubernetes.Interface,
 		return nil, err
 	}
 	nsc.nodeIP = NodeIP
+	automtu, err := utils.GetMTUFromNodeIP(nsc.nodeIP, config.EnableOverlay)
+	if err != nil {
+		return nil, err
+	}
+	// Sets it to 20 bytes less than the auto-detected MTU to account for additional ip-ip headers needed for DSR, above
+	// method GetMTUFromNodeIP() already accounts for the overhead of ip-ip overlay networking, so we only need to
+	// remove 20 bytes
+	nsc.dsrTCPMSS = automtu - 20
 
 	nsc.podLister = podInformer.GetIndexer()
 

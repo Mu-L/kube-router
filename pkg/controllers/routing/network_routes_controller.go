@@ -44,6 +44,7 @@ const (
 	nodeAddrsIPSetName   = "kube-router-node-ips"
 
 	nodeASNAnnotation                  = "kube-router.io/node.asn"
+	nodeCommunitiesAnnotation          = "kube-router.io/node.bgp.communities"
 	pathPrependASNAnnotation           = "kube-router.io/path-prepend.as"
 	pathPrependRepeatNAnnotation       = "kube-router.io/path-prepend.repeat-n"
 	peerASNAnnotation                  = "kube-router.io/peer.asns"
@@ -86,6 +87,7 @@ type NetworkRoutingController struct {
 	autoMTU                        bool
 	defaultNodeAsnNumber           uint32
 	nodeAsnNumber                  uint32
+	nodeCommunities                []string
 	globalPeerRouters              []*gobgpapi.Peer
 	nodePeerRouters                []string
 	enableCNI                      bool
@@ -116,6 +118,7 @@ type NetworkRoutingController struct {
 	overrideNextHop                bool
 	podCidr                        string
 	CNIFirewallSetup               *sync.Cond
+	ipsetMutex                     *sync.Mutex
 
 	nodeLister cache.Indexer
 	svcLister  cache.Indexer
@@ -213,7 +216,7 @@ func (nrc *NetworkRoutingController) Run(healthChan chan<- *healthcheck.Controll
 	}
 
 	if nrc.autoMTU {
-		mtu, err := getMTUFromNodeIP(nrc.nodeIP, nrc.enableOverlays)
+		mtu, err := utils.GetMTUFromNodeIP(nrc.nodeIP, nrc.enableOverlays)
 		if err != nil {
 			klog.Errorf("Failed to find MTU for node IP: %s for intelligently setting the kube-bridge MTU due to %s.", nrc.nodeIP, err.Error())
 		}
@@ -371,7 +374,7 @@ func (nrc *NetworkRoutingController) updateCNIConfig() {
 }
 
 func (nrc *NetworkRoutingController) autoConfigureMTU() error {
-	mtu, err := getMTUFromNodeIP(nrc.nodeIP, nrc.enableOverlays)
+	mtu, err := utils.GetMTUFromNodeIP(nrc.nodeIP, nrc.enableOverlays)
 	if err != nil {
 		return fmt.Errorf("failed to generate MTU: %s", err.Error())
 	}
@@ -643,6 +646,13 @@ func (nrc *NetworkRoutingController) Cleanup() {
 	}
 
 	// delete all ipsets created by kube-router
+	klog.V(1).Infof("Attempting to attain ipset mutex lock")
+	nrc.ipsetMutex.Lock()
+	klog.V(1).Infof("Attained ipset mutex lock, continuing...")
+	defer func() {
+		nrc.ipsetMutex.Unlock()
+		klog.V(1).Infof("Returned ipset mutex lock")
+	}()
 	ipset, err := utils.NewIPSet(nrc.isIpv6)
 	if err != nil {
 		klog.Errorf("Failed to clean up ipsets: " + err.Error())
@@ -665,6 +675,13 @@ func (nrc *NetworkRoutingController) syncNodeIPSets() error {
 		if nrc.MetricsEnabled {
 			metrics.ControllerRoutesSyncTime.Observe(time.Since(start).Seconds())
 		}
+	}()
+	klog.V(1).Infof("Attempting to attain ipset mutex lock")
+	nrc.ipsetMutex.Lock()
+	klog.V(1).Infof("Attained ipset mutex lock, continuing...")
+	defer func() {
+		nrc.ipsetMutex.Unlock()
+		klog.V(1).Infof("Returned ipset mutex lock")
 	}()
 
 	nodes := nrc.nodeLister.List()
@@ -856,6 +873,28 @@ func (nrc *NetworkRoutingController) startBgpServer(grpcServer bool) error {
 		nrc.pathPrependCount = uint8(repeatN)
 	}
 
+	var nodeCommunities []string
+	nodeBGPCommunitiesAnnotation, ok := node.ObjectMeta.Annotations[nodeCommunitiesAnnotation]
+	if !ok {
+		klog.V(1).Info("Did not find any BGP communities on current node's annotations. " +
+			"Not exporting communities.")
+	} else {
+		nodeCommunities = stringToSlice(nodeBGPCommunitiesAnnotation, ",")
+		for _, nodeCommunity := range nodeCommunities {
+			if err = validateCommunity(nodeCommunity); err != nil {
+				klog.Warningf("cannot add BGP community '%s' from node annotation as it does not appear "+
+					"to be a valid community identifier", nodeCommunity)
+				continue
+			}
+			klog.V(1).Infof("Adding the node community found from node annotation: %s", nodeCommunity)
+			nrc.nodeCommunities = append(nrc.nodeCommunities, nodeCommunity)
+		}
+		if len(nrc.nodeCommunities) < 1 {
+			klog.Warningf("Found a community specified via annotation %s with value %s but none could be "+
+				"validated", nodeCommunitiesAnnotation, nodeBGPCommunitiesAnnotation)
+		}
+	}
+
 	if grpcServer {
 		nrc.bgpServer = gobgp.NewBgpServer(gobgp.GrpcListenAddress(nrc.nodeIP.String() + ":50051" + "," + "127.0.0.1:50051"))
 	} else {
@@ -995,11 +1034,11 @@ func (nrc *NetworkRoutingController) startBgpServer(grpcServer bool) error {
 func NewNetworkRoutingController(clientset kubernetes.Interface,
 	kubeRouterConfig *options.KubeRouterConfig,
 	nodeInformer cache.SharedIndexInformer, svcInformer cache.SharedIndexInformer,
-	epInformer cache.SharedIndexInformer) (*NetworkRoutingController, error) {
+	epInformer cache.SharedIndexInformer, ipsetMutex *sync.Mutex) (*NetworkRoutingController, error) {
 
 	var err error
 
-	nrc := NetworkRoutingController{}
+	nrc := NetworkRoutingController{ipsetMutex: ipsetMutex}
 	if kubeRouterConfig.MetricsEnabled {
 		//Register the metrics for this controller
 		prometheus.MustRegister(metrics.ControllerBGPadvertisementsReceived)

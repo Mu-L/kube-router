@@ -111,8 +111,8 @@ kubectl annotate node <kube-node> "kube-router.io/path-prepend.repeat-n=5"
 
 The examples above have assumed there is no password authentication with BGP
 peer routers. If you need to use a password for peering, you can use the
-`--peer-router-passwords` CLI flag or the `kube-router.io/peer.passwords` node
-annotation.
+`--peer-router-passwords` command-line option, the `kube-router.io/peer.passwords` node
+annotation, or the `--peer-router-passwords-file` command-line option.
 
 #### Base64 Encoding Passwords
 
@@ -144,9 +144,38 @@ kubectl annotate node <kube-node> "kube-router.io/peer.asns=65000,65000"
 kubectl annotate node <kube-node> "kube-router.io/peer.passwords=U2VjdXJlUGFzc3dvcmQK,"
 ```
 
+Finally, to include peer passwords as a file you would run kube-router with the following option:
+```
+--peer-router-ips="192.168.1.99,192.168.1.100"
+--peer-router-asns="65000,65000"
+--peer-router-passwords-file="/etc/kube-router/bgp-passwords.conf"
+```
+
+The password file, closely follows the syntax of the command-line and node annotation options.
+Here, the first peer IP (192.168.1.99) would be configured with a password, while the second would not.
+```
+U2VjdXJlUGFzc3dvcmQK,
+```
+
+Note, complex parsing is not done on this file, please do not include any content other than the passwords on a single line in this file.
+
+### BGP Communities
+
+Global peers support the addition of BGP communities via node annotations. Node annotations can be formulated either as:
+* a single 32-bit integer
+* two 16-bit integers separated by a colon (`:`)
+* common BGP community names (e.g. `no-export`, `internet`, `no-peer`, etc.) (see: [WellKnownCommunityNameMap](https://github.com/osrg/gobgp/blob/cbdb752b10847163d9f942853b67cf173b6aa151/pkg/packet/bgp/bgp.go#L9444))
+
+In the following example we add the `NO_EXPORT` BGP community to two of our nodes via annotation using all three forms of the annotation:
+```
+kubectl annotate node <kube-node> "kube-router.io/node.bgp.communities=4294967041"
+kubectl annotate node <kube-node> "kube-router.io/node.bgp.communities=65535:65281"
+kubectl annotate node <kube-node> "kube-router.io/node.bgp.communities=no-export"
+```
+
 ## BGP listen address list 
 
-By default GoBGP server binds on the node IP address. However in case of nodes with multiple IP address it is desirable to bind GoBGP to multiple local adresses. Local IP address on which GoGBP should listen on an node can be configured with annotation `kube-router.io/bgp-local-addresses`.
+By default, GoBGP server binds on the node IP address. However in case of nodes with multiple IP address it is desirable to bind GoBGP to multiple local adresses. Local IP address on which GoGBP should listen on a node can be configured with annotation `kube-router.io/bgp-local-addresses`.
 
 Here is sample example to make GoBGP server to listen on multiple IP address
 ```

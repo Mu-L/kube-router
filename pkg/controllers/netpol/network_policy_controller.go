@@ -6,7 +6,6 @@ import (
 	"encoding/base32"
 	"fmt"
 	"net"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -33,6 +32,7 @@ const (
 	kubeInputChainName           = "KUBE-ROUTER-INPUT"
 	kubeForwardChainName         = "KUBE-ROUTER-FORWARD"
 	kubeOutputChainName          = "KUBE-ROUTER-OUTPUT"
+	kubeDefaultNetpolChain       = "KUBE-NWPLCY-DEFAULT"
 )
 
 // Network policy controller provides both ingress and egress filtering for the pods as per the defined network
@@ -58,6 +58,7 @@ type NetworkPolicyController struct {
 	MetricsEnabled          bool
 	healthChan              chan<- *healthcheck.ControllerHeartbeat
 	fullSyncRequestChan     chan struct{}
+	ipsetMutex              *sync.Mutex
 
 	ipSetHandler *utils.IPSet
 
@@ -122,6 +123,7 @@ type egressRule struct {
 type protocolAndPort struct {
 	protocol string
 	port     string
+	endport  string
 }
 
 type endPoints struct {
@@ -142,8 +144,11 @@ func (npc *NetworkPolicyController) Run(healthChan chan<- *healthcheck.Controlle
 	klog.Info("Starting network policy controller")
 	npc.healthChan = healthChan
 
-	// setup kube-router specific top level custom chains
+	// setup kube-router specific top level custom chains (KUBE-ROUTER-INPUT, KUBE-ROUTER-FORWARD, KUBE-ROUTER-OUTPUT)
 	npc.ensureTopLevelChains()
+
+	// setup default network policy chain that is applied to traffic from/to the pods that does not match any network policy
+	npc.ensureDefaultNetworkPolicyChain()
 
 	// Full syncs of the network policy controller take a lot of time and can only be processed one at a time,
 	// therefore, we start it in it's own goroutine and request a sync through a single item channel
@@ -219,6 +224,9 @@ func (npc *NetworkPolicyController) fullPolicySync() {
 	// ensure kube-router specific top level chains and corresponding rules exist
 	npc.ensureTopLevelChains()
 
+	// ensure default network policy chain that is applied to traffic from/to the pods that does not match any network policy
+	npc.ensureDefaultNetworkPolicyChain()
+
 	networkPoliciesInfo, err = npc.buildNetworkPoliciesInfo()
 	if err != nil {
 		klog.Errorf("Aborting sync. Failed to build network policies: %v", err.Error())
@@ -250,7 +258,7 @@ func (npc *NetworkPolicyController) fullPolicySync() {
 	}
 
 	if err := utils.Restore("filter", npc.filterTableRules.Bytes()); err != nil {
-		klog.Errorf("Aborting sync. Failed to run iptables-restore: %v" + err.Error())
+		klog.Errorf("Aborting sync. Failed to run iptables-restore: %v\n%s", err.Error(), npc.filterTableRules.String())
 		return
 	}
 
@@ -376,6 +384,38 @@ func (npc *NetworkPolicyController) ensureTopLevelChains() {
 		ensureRuleAtPosition(kubeInputChainName, whitelistServiceVips, uuid, externalIPIndex+4)
 	}
 
+	// for the traffic to/from the local pod's let network policy controller be
+	// authoritative entity to ACCEPT the traffic if it complies to network policies
+	for _, chain := range chains {
+		comment := "rule to explicitly ACCEPT traffic that comply to network policies"
+		args := []string{"-m", "comment", "--comment", comment, "-m", "mark", "--mark", "0x20000/0x20000", "-j", "ACCEPT"}
+		err = iptablesCmdHandler.AppendUnique("filter", chain, args...)
+		if err != nil {
+			klog.Fatalf("Failed to run iptables command: %s", err.Error())
+		}
+	}
+}
+
+// Creates custom chains KUBE-NWPLCY-DEFAULT
+func (npc *NetworkPolicyController) ensureDefaultNetworkPolicyChain() {
+
+	iptablesCmdHandler, err := iptables.New()
+	if err != nil {
+		klog.Fatalf("Failed to initialize iptables executor due to %s", err.Error())
+	}
+
+	markArgs := make([]string, 0)
+	markComment := "rule to mark traffic matching a network policy"
+	markArgs = append(markArgs, "-j", "MARK", "-m", "comment", "--comment", markComment, "--set-xmark", "0x10000/0x10000")
+
+	err = iptablesCmdHandler.NewChain("filter", kubeDefaultNetpolChain)
+	if err != nil && err.(*iptables.Error).ExitStatus() != 1 {
+		klog.Fatalf("Failed to run iptables command to create %s chain due to %s", kubeDefaultNetpolChain, err.Error())
+	}
+	err = iptablesCmdHandler.AppendUnique("filter", kubeDefaultNetpolChain, markArgs...)
+	if err != nil {
+		klog.Fatalf("Failed to run iptables command: %s", err.Error())
+	}
 }
 
 func (npc *NetworkPolicyController) cleanupStaleRules(activePolicyChains, activePodFwChains map[string]bool) error {
@@ -396,6 +436,9 @@ func (npc *NetworkPolicyController) cleanupStaleRules(activePolicyChains, active
 	}
 	for _, chain := range chains {
 		if strings.HasPrefix(chain, kubeNetworkPolicyChainPrefix) {
+			if chain == kubeDefaultNetpolChain {
+				continue
+			}
 			if _, ok := activePolicyChains[chain]; !ok {
 				cleanupPolicyChains = append(cleanupPolicyChains, chain)
 			}
@@ -568,6 +611,13 @@ func (npc *NetworkPolicyController) Cleanup() {
 	}
 
 	// delete all ipsets
+	klog.V(1).Infof("Attempting to attain ipset mutex lock")
+	npc.ipsetMutex.Lock()
+	klog.V(1).Infof("Attained ipset mutex lock, continuing...")
+	defer func() {
+		npc.ipsetMutex.Unlock()
+		klog.V(1).Infof("Returned ipset mutex lock")
+	}()
 	ipset, err := utils.NewIPSet(false)
 	if err != nil {
 		klog.Errorf("Failed to clean up ipsets: " + err.Error())
@@ -587,8 +637,8 @@ func (npc *NetworkPolicyController) Cleanup() {
 // NewNetworkPolicyController returns new NetworkPolicyController object
 func NewNetworkPolicyController(clientset kubernetes.Interface,
 	config *options.KubeRouterConfig, podInformer cache.SharedIndexInformer,
-	npInformer cache.SharedIndexInformer, nsInformer cache.SharedIndexInformer) (*NetworkPolicyController, error) {
-	npc := NetworkPolicyController{}
+	npInformer cache.SharedIndexInformer, nsInformer cache.SharedIndexInformer, ipsetMutex *sync.Mutex) (*NetworkPolicyController, error) {
+	npc := NetworkPolicyController{ipsetMutex: ipsetMutex}
 
 	// Creating a single-item buffered channel to ensure that we only keep a single full sync request at a time,
 	// additional requests would be pointless to queue since after the first one was processed the system would already
@@ -603,26 +653,9 @@ func NewNetworkPolicyController(clientset kubernetes.Interface,
 	npc.serviceClusterIPRange = *ipnet
 
 	// Validate and parse NodePort range
-	nodePortValidator := regexp.MustCompile(`^([0-9]+)[:-]([0-9]+)$`)
-	if matched := nodePortValidator.MatchString(config.NodePortRange); !matched {
-		return nil, fmt.Errorf("failed to parse node port range given: '%s' please see specification in help text", config.NodePortRange)
+	if npc.serviceNodePortRange, err = validateNodePortRange(config.NodePortRange); err != nil {
+		return nil, err
 	}
-	matches := nodePortValidator.FindStringSubmatch(config.NodePortRange)
-	if len(matches) != 3 {
-		return nil, fmt.Errorf("could not parse port number from range given: '%s'", config.NodePortRange)
-	}
-	port1, err := strconv.ParseInt(matches[1], 10, 16)
-	if err != nil {
-		return nil, fmt.Errorf("could not parse first port number from range given: '%s'", config.NodePortRange)
-	}
-	port2, err := strconv.ParseInt(matches[2], 10, 16)
-	if err != nil {
-		return nil, fmt.Errorf("could not parse second port number from range given: '%s'", config.NodePortRange)
-	}
-	if port1 >= port2 {
-		return nil, fmt.Errorf("port 1 is greater than or equal to port 2 in range given: '%s'", config.NodePortRange)
-	}
-	npc.serviceNodePortRange = fmt.Sprintf("%d:%d", port1, port2)
 
 	// Validate and parse ExternalIP service range
 	for _, externalIPRange := range config.ExternalIPCIDRs {
